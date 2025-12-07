@@ -1,0 +1,138 @@
+# Main configuration
+seed: 42
+device: auto  # auto, cpu, cuda
+
+# VNF Types
+vnf_types:
+  - NAT
+  - FW
+  - VOC
+  - TM
+  - WO
+  - IDPS
+
+# SFC Types
+sfc_types:
+  - CG
+  - AR
+  - VS
+  - VoIP
+  - MIoT
+  - Ind4.0
+
+# SFC Characteristics
+sfc_characteristics:
+  CG:
+    chain: [NAT, FW, TM, WO]
+    bandwidth: 50
+    delay: 50
+    bundle_size: [10, 20]
+  AR:
+    chain: [NAT, FW, VOC]
+    bandwidth: 30
+    delay: 20
+    bundle_size: [15, 25]
+  VS:
+    chain: [NAT, FW, VOC, TM]
+    bandwidth: 40
+    delay: 100
+    bundle_size: [20, 30]
+  VoIP:
+    chain: [NAT, FW]
+    bandwidth: 10
+    delay: 150
+    bundle_size: [25, 35]
+  MIoT:
+    chain: [NAT, FW, IDPS]
+    bandwidth: 5
+    delay: 30
+    bundle_size: [30, 40]
+  Ind4.0:
+    chain: [NAT, FW, IDPS, TM]
+    bandwidth: 20
+    delay: 10
+    bundle_size: [10, 20]
+
+# VNF Resources
+vnf_resources:
+  NAT:
+    cpu: 2
+    ram: 4
+    storage: 10
+    proc_time: 5
+  FW:
+    cpu: 3
+    ram: 6
+    storage: 15
+    proc_time: 8
+  VOC:
+    cpu: 5
+    ram: 10
+    storage: 30
+    proc_time: 15
+  TM:
+    cpu: 2
+    ram: 5
+    storage: 20
+    proc_time: 6
+  WO:
+    cpu: 4
+    ram: 8
+    storage: 25
+    proc_time: 12
+  IDPS:
+    cpu: 6
+    ram: 12
+    storage: 40
+    proc_time: 20
+
+# Network Configuration
+network:
+  num_dcs: 4
+  dc_storage: 2000
+  dc_cpu_range: [12, 120]
+  dc_ram: 256
+  link_bandwidth: 1000
+  speed_of_light: 300000  # km/s
+
+# Training Configuration
+training:
+  num_updates: 100
+  episodes_per_update: 20
+  actions_per_step: 100
+  step_duration: 1
+  action_inference_time: 0.01
+  request_generation_interval: 4
+  gamma: 0.99
+  learning_rate: 0.001
+  batch_size: 64
+  replay_buffer_size: 50000
+  epsilon_start: 1.0
+  epsilon_end: 0.01
+  epsilon_decay: 0.995
+
+# Rewards
+rewards:
+  sfc_satisfied: 2.0
+  sfc_dropped: -1.5
+  invalid_action: -1.0
+  uninstall_required: -0.5
+  default: 0.0
+
+# Priority
+priority:
+  threshold: 10
+  urgency_constant: 100
+  epsilon: 0.000001
+
+# Logging
+logging:
+  log_dir: logs
+  save_interval: 10
+  print_interval: 1
+
+# Output
+output:
+  model_dir: models
+  results_dir: results
+  plot_results: true
