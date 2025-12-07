@@ -109,12 +109,20 @@ class ReplayBuffer:
         import random
         batch = random.sample(self.buffer, batch_size)
         
-        state1, state2, state3, action, reward, next_state1, next_state2, next_state3, done = zip(*batch)
+        state1, state2, state3, action, reward, \
+        next_state1, next_state2, next_state3, done = zip(*batch)
         
-        return (torch.FloatTensor(state1), torch.FloatTensor(state2), torch.FloatTensor(state3),
-                torch.LongTensor(action), torch.FloatTensor(reward),
-                torch.FloatTensor(next_state1), torch.FloatTensor(next_state2), torch.FloatTensor(next_state3),
-                torch.FloatTensor(done))
+        return (
+            torch.FloatTensor(state1).to(self.device),
+            torch.FloatTensor(state2).to(self.device),
+            torch.FloatTensor(state3).to(self.device),
+            torch.LongTensor(action).to(self.device),
+            torch.FloatTensor(reward).to(self.device),
+            torch.FloatTensor(next_state1).to(self.device),
+            torch.FloatTensor(next_state2).to(self.device),
+            torch.FloatTensor(next_state3).to(self.device),
+            torch.FloatTensor(done).to(self.device)
+        )
     
     def __len__(self):
         return len(self.buffer)

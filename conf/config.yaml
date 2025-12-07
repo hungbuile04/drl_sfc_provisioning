@@ -98,8 +98,8 @@ network:
 # Training Configuration
 training:
   num_updates: 100
-  episodes_per_update: 20
-  actions_per_step: 100
+  episodes_per_update: 10
+  actions_per_step: 50
   step_duration: 1
   action_inference_time: 0.01
   request_generation_interval: 4
