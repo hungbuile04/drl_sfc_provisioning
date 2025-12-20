@@ -1,241 +1,217 @@
 """
-SFC Provisioning Algorithm (Algorithm 1 from paper)
+SFC Request Management and VNF Instances
 """
 import numpy as np
-from omegaconf import DictConfig
-from agent import StateBuilder
+import config
 
 
-class SFCProvisioner:
-    def __init__(self, env, agent, cfg: DictConfig):
-        self.env = env
-        self.agent = agent
-        self.cfg = cfg
-        self.state_builder = StateBuilder(cfg)
+class VNFInstance:
+    """VNF instance installed in a DC"""
     
-    def set_dc_priority(self):
-        """Set priority for DCs based on resources and pending requests"""
-        if not self.env.sfc_requests:
-            return list(range(len(self.env.dcs)))
-        
-        min_delay_sfc = min(self.env.sfc_requests, 
-                           key=lambda x: x.get_remaining_time(self.env.current_time))
-        
-        path = self.env.get_shortest_path(min_delay_sfc.source, min_delay_sfc.destination)
-        
-        dc_priorities = []
-        for dc in self.env.dcs:
-            if dc.id in path:
-                priority = path.index(dc.id)
-            else:
-                priority = len(path) + dc.id
-            dc_priorities.append((dc.id, priority))
-        
-        dc_priorities.sort(key=lambda x: x[1])
-        return [dc_id for dc_id, _ in dc_priorities]
+    def __init__(self, vnf_type, dc_id):
+        self.vnf_type = vnf_type
+        self.dc_id = dc_id
+        self.remaining_proc_time = 0.0  # ms
+        self.assigned_sfc_id = None
+        self.waiting_time = 0.0  # ms
     
-    def get_action_type_and_vnf(self, action):
-        """Decode action into action type and VNF type"""
-        num_vnf_types = len(self.cfg.vnf_types)
-        
-        if action < num_vnf_types:
-            return 'uninstall', self.cfg.vnf_types[action]
-        elif action < 2 * num_vnf_types:
-            vnf_idx = action - num_vnf_types
-            return 'allocate', self.cfg.vnf_types[vnf_idx]
-        else:
-            return 'wait', None
+    def is_idle(self):
+        """Check if VNF is idle"""
+        return self.remaining_proc_time <= 0 and self.assigned_sfc_id is None
     
-    def calculate_vnf_priority(self, vnf, sfc_request, dc_id):
-        """Calculate priority for VNF allocation"""
-        priority = 0
-        
-        # P1: Based on remaining time
-        remaining_time = sfc_request.get_remaining_time(self.env.current_time)
-        p1 = -remaining_time
-        
-        # P2: SFC-based priority
-        p2 = 0
-        if dc_id in sfc_request.allocated_dcs:
-            p2 += 10
-        else:
-            p2 -= len(set(sfc_request.allocated_dcs))
-        
-        # P3: Urgency
-        p3 = 0
-        if remaining_time < self.cfg.priority.threshold:
-            p3 = self.cfg.priority.urgency_constant / (remaining_time + self.cfg.priority.epsilon)
-        
-        priority = p1 + p2 + p3
-        return priority
+    def assign(self, sfc_id, proc_time_ms, waiting_time_ms=0.0):
+        """Assign VNF to an SFC request"""
+        self.assigned_sfc_id = sfc_id
+        self.remaining_proc_time = max(config.TIME_STEP, proc_time_ms)
+        self.waiting_time = waiting_time_ms
     
-    def select_vnf_for_allocation(self, vnf_type, dc_id):
-        """Select highest priority VNF for allocation"""
-        vnf_priorities = []
-        
-        for sfc in self.env.sfc_requests:
-            next_vnf = sfc.get_next_vnf()
-            if next_vnf == vnf_type:
-                priority = self.calculate_vnf_priority(next_vnf, sfc, dc_id)
-                vnf_priorities.append((sfc, priority))
-        
-        if not vnf_priorities:
-            return None
-        
-        vnf_priorities.sort(key=lambda x: x[1], reverse=True)
-        return vnf_priorities[0][0]
+    def tick(self):
+        """Update VNF state after one time step"""
+        if self.remaining_proc_time > 0:
+            self.remaining_proc_time = max(0, self.remaining_proc_time - config.TIME_STEP)
+            
+            if self.remaining_proc_time <= 0:
+                self.assigned_sfc_id = None
+                self.waiting_time = 0.0
+                self.remaining_proc_time = 0.0
     
-    def perform_action(self, action, dc_id):
-        """Perform the selected action"""
-        action_type, vnf_type = self.get_action_type_and_vnf(action)
-        reward = self.cfg.rewards.default
+    def get_total_delay(self):
+        """Return total delay (waiting + processing)"""
+        return self.waiting_time + self.remaining_proc_time
+
+
+class SFCRequest:
+    """SFC request with VNF chain"""
+    
+    def __init__(self, req_id, sfc_type, source, destination, arrival_time):
+        self.id = req_id
+        self.type = sfc_type
+        self.specs = config.SFC_SPECS[sfc_type]
+        self.chain = self.specs['chain'][:]
+        self.current_vnf_index = 0
         
-        dc = self.env.dcs[dc_id]
+        self.source = source
+        self.destination = destination
+        self.arrival_time = arrival_time
         
-        if action_type == 'wait':
-            pass
+        self.max_delay = self.specs['delay']  # ms
+        self.elapsed_time = 0.0  # ms
         
-        elif action_type == 'uninstall':
-            if dc.installed_vnfs[vnf_type] > dc.allocated_vnfs[vnf_type]:
-                has_waiting = any(sfc.get_next_vnf() == vnf_type for sfc in self.env.sfc_requests)
+        self.is_dropped = False
+        self.is_completed = False
+        self.all_vnfs_processed = False
+        
+        # Track placed VNFs: [(vnf_name, dc_id, prop_delay, proc_delay)]
+        self.placed_vnfs = []
+        
+        # Total delays
+        self.total_propagation_delay = 0.0  # ms
+        self.total_processing_delay = 0.0   # ms
+        
+        # Track VNF instances processing this request
+        self.processing_vnf_instances = []
+    
+    def get_next_vnf(self):
+        """Get next VNF in chain that needs to be placed"""
+        if self.current_vnf_index < len(self.chain):
+            return self.chain[self.current_vnf_index]
+        return None
+    
+    def advance_chain(self, dc_id, prop_delay=0.0, proc_delay=0.0, vnf_instance=None):
+        """Advance in chain after successfully placing VNF"""
+        if self.is_completed:
+            return
+        
+        vnf_name = self.chain[self.current_vnf_index]
+        self.placed_vnfs.append((vnf_name, dc_id, prop_delay, proc_delay))
+        
+        # Accumulate delays
+        self.total_propagation_delay += prop_delay
+        self.total_processing_delay += proc_delay
+        
+        # Track VNF instance
+        if vnf_instance:
+            self.processing_vnf_instances.append(vnf_instance)
+        
+        self.current_vnf_index += 1
+    
+    def check_completion(self):
+        """
+        Check if all VNFs are processed
+        Complete when:
+        1. All VNFs placed
+        2. All VNFs finished processing (idle)
+        """
+        if self.is_completed or self.is_dropped:
+            return
+        
+        if self.current_vnf_index >= len(self.chain):
+            all_idle = all(vnf.is_idle() for vnf in self.processing_vnf_instances)
+            
+            if all_idle:
+                self.is_completed = True
+                self.all_vnfs_processed = True
+    
+    def get_total_e2e_delay(self):
+        """Calculate total E2E delay"""
+        return self.total_propagation_delay + self.total_processing_delay
+    
+    def get_remaining_time(self):
+        """Time remaining before drop"""
+        return max(0, self.max_delay - self.elapsed_time)
+    
+    def update_time(self):
+        """Update elapsed time"""
+        if self.is_completed or self.is_dropped:
+            return
+        
+        self.elapsed_time += config.TIME_STEP
+        
+        # Check completion first
+        self.check_completion()
+        
+        # Check drop condition
+        if not self.is_completed and self.elapsed_time > self.max_delay:
+            self.is_dropped = True
+    
+    def get_last_placed_dc(self):
+        """Get DC ID of last placed VNF"""
+        if self.placed_vnfs:
+            return self.placed_vnfs[-1][1]
+        return None
+
+
+class SFC_Manager:
+    """Manage all SFC requests"""
+    
+    def __init__(self):
+        self.active_requests = []
+        self.completed_history = []
+        self.dropped_history = []
+        self.req_counter = 0
+    
+    def reset_history(self):
+        """Reset to initial state"""
+        self.active_requests = []
+        self.completed_history = []
+        self.dropped_history = []
+        self.req_counter = 0
+    
+    def generate_requests(self, time_step, num_dcs):
+        """Generate SFC request bundles"""
+        generated_count = 0
+        
+        for sfc_type in config.SFC_TYPES:
+            if np.random.rand() < 0.3:  # 30% probability
+                bundle_min, bundle_max = config.SFC_SPECS[sfc_type]['bundle']
+                count = np.random.randint(bundle_min, bundle_max + 1)
                 
-                if not has_waiting:
-                    dc.uninstall_vnf(vnf_type, self.cfg.vnf_resources)
-                else:
-                    reward = self.cfg.rewards.uninstall_required
-            else:
-                reward = self.cfg.rewards.invalid_action
-        
-        elif action_type == 'allocate':
-            if not dc.can_install_vnf(vnf_type, self.cfg.vnf_resources) and dc.installed_vnfs[vnf_type] == 0:
-                if dc.install_vnf(vnf_type, self.cfg.vnf_resources):
-                    pass
-                else:
-                    reward = self.cfg.rewards.invalid_action
-                    return reward
-            
-            if dc.installed_vnfs[vnf_type] <= dc.allocated_vnfs[vnf_type]:
-                reward = self.cfg.rewards.invalid_action
-                return reward
-            
-            selected_sfc = self.select_vnf_for_allocation(vnf_type, dc_id)
-            
-            if selected_sfc:
-                if dc.allocate_vnf(vnf_type):
-                    selected_sfc.allocate_vnf(vnf_type, dc_id)
+                for _ in range(count):
+                    src = np.random.randint(0, num_dcs)
+                    dst = np.random.randint(0, num_dcs)
                     
-                    if selected_sfc.is_completed():
-                        if self.env.check_sfc_completion(selected_sfc):
-                            reward = self.cfg.rewards.sfc_satisfied
-                            self.env.satisfied_sfcs.append(selected_sfc)
-                            self.env.sfc_requests.remove(selected_sfc)
-                            
-                            for vnf, dc_idx in zip(selected_sfc.allocated_vnfs, 
-                                                   selected_sfc.allocated_dcs):
-                                self.env.dcs[dc_idx].deallocate_vnf(vnf)
-                        else:
-                            reward = self.cfg.rewards.sfc_dropped
-                            self.env.dropped_sfcs.append(selected_sfc)
-                            self.env.sfc_requests.remove(selected_sfc)
-                            
-                            for vnf, dc_idx in zip(selected_sfc.allocated_vnfs, 
-                                                   selected_sfc.allocated_dcs):
-                                self.env.dcs[dc_idx].deallocate_vnf(vnf)
+                    while dst == src:
+                        dst = np.random.randint(0, num_dcs)
+                    
+                    req = SFCRequest(self.req_counter, sfc_type, src, dst, time_step)
+                    self.active_requests.append(req)
+                    self.req_counter += 1
+                    generated_count += 1
+        
+        return generated_count
+    
+    def clean_requests(self):
+        """Move completed/dropped requests to history"""
+        still_active = []
+        
+        for req in self.active_requests:
+            if req.is_completed:
+                self.completed_history.append(req)
+            elif req.is_dropped:
+                self.dropped_history.append(req)
             else:
-                reward = self.cfg.rewards.invalid_action
+                still_active.append(req)
         
-        return reward
+        self.active_requests = still_active
     
-    def run_episode(self, training=True):
-        """Run one episode of SFC provisioning"""
-        self.env.reset()
-        total_reward = 0
-        step_count = 0
+    def get_statistics(self):
+        """Calculate statistics"""
+        total = self.req_counter
+        accepted = len(self.completed_history)
+        dropped = len(self.dropped_history)
         
-        while self.env.sfc_requests and step_count < 1000:
-            dc_list = self.set_dc_priority()
-            
-            for _ in range(self.cfg.training.actions_per_step):
-                if not self.env.sfc_requests:
-                    break
-                
-                dc_id = dc_list[0]
-                
-                # Build states
-                state1 = self.state_builder.build_state1(self.env.dcs[dc_id])
-                state2 = self.state_builder.build_state2(self.env, dc_id)
-                state3 = self.state_builder.build_state3(self.env)
-                
-                # Select action
-                action = self.agent.select_action(state1, state2, state3, training=training)
-                
-                # Perform action
-                reward = self.perform_action(action, dc_id)
-                total_reward += reward
-                
-                # Build next states
-                next_state1 = self.state_builder.build_state1(self.env.dcs[dc_id])
-                next_state2 = self.state_builder.build_state2(self.env, dc_id)
-                next_state3 = self.state_builder.build_state3(self.env)
-                
-                done = len(self.env.sfc_requests) == 0
-                
-                # Store transition
-                if training:
-                    self.agent.store_transition(state1, state2, state3, action, reward,
-                                               next_state1, next_state2, next_state3, done)
-                
-                dc_list = self.set_dc_priority()
-            
-            self.env.step()
-            step_count += 1
+        acc_ratio = (accepted / total * 100) if total > 0 else 0.0
+        drop_ratio = (dropped / total * 100) if total > 0 else 0.0
         
-        return total_reward
-    
-    def get_metrics(self):
-        """Get performance metrics"""
-        total_requests = len(self.env.satisfied_sfcs) + len(self.env.dropped_sfcs)
-        
-        if total_requests == 0:
-            return {
-                'acceptance_ratio': 0,
-                'avg_e2e_delay': 0,
-                'cpu_utilization': 0,
-                'storage_utilization': 0,
-                'satisfied_count': 0,
-                'dropped_count': 0
-            }
-        
-        acceptance_ratio = len(self.env.satisfied_sfcs) / total_requests
-        
-        # Calculate average E2E delay
-        total_delay = 0
-        for sfc in self.env.satisfied_sfcs:
-            prop_delay = 0
-            for i in range(len(sfc.allocated_dcs) - 1):
-                dc_i = sfc.allocated_dcs[i]
-                dc_j = sfc.allocated_dcs[i + 1]
-                prop_delay += self.env.distance_matrix[dc_i][dc_j] / self.cfg.network.speed_of_light
-            
-            proc_delay = sum([self.cfg.vnf_resources[vnf]['proc_time'] for vnf in sfc.allocated_vnfs])
-            total_delay += prop_delay + proc_delay
-        
-        avg_e2e_delay = total_delay / len(self.env.satisfied_sfcs) if self.env.satisfied_sfcs else 0
-        
-        # Resource utilization
-        total_cpu_used = sum(dc.cpu_total - dc.cpu_available for dc in self.env.dcs)
-        total_cpu = sum(dc.cpu_total for dc in self.env.dcs)
-        cpu_utilization = total_cpu_used / total_cpu if total_cpu > 0 else 0
-        
-        total_storage_used = sum(dc.storage_total - dc.storage_available for dc in self.env.dcs)
-        total_storage = sum(dc.storage_total for dc in self.env.dcs)
-        storage_utilization = total_storage_used / total_storage if total_storage > 0 else 0
+        avg_e2e = 0.0
+        if self.completed_history:
+            avg_e2e = np.mean([r.get_total_e2e_delay() for r in self.completed_history])
         
         return {
-            'acceptance_ratio': acceptance_ratio,
-            'avg_e2e_delay': avg_e2e_delay,
-            'cpu_utilization': cpu_utilization,
-            'storage_utilization': storage_utilization,
-            'satisfied_count': len(self.env.satisfied_sfcs),
-            'dropped_count': len(self.env.dropped_sfcs)
+            'acceptance_ratio': acc_ratio,
+            'drop_ratio': drop_ratio,
+            'total_generated': total,
+            'total_accepted': accepted,
+            'total_dropped': dropped,
+            'avg_e2e_delay': avg_e2e
         }

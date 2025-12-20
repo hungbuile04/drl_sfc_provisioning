@@ -26,32 +26,38 @@ sfc_characteristics:
     chain: [NAT, FW, TM, WO]
     bandwidth: 50
     delay: 50
-    bundle_size: [10, 20]
+    # bundle_size: [10, 20]
+    bundle_size: [2,4]
   AR:
     chain: [NAT, FW, VOC]
     bandwidth: 30
     delay: 20
-    bundle_size: [15, 25]
+    # bundle_size: [15, 25]
+    bundle_size: [2,4]
   VS:
     chain: [NAT, FW, VOC, TM]
     bandwidth: 40
     delay: 100
-    bundle_size: [20, 30]
+    # bundle_size: [20, 30]
+    bundle_size: [2,4]
   VoIP:
     chain: [NAT, FW]
     bandwidth: 10
     delay: 150
-    bundle_size: [25, 35]
+    # bundle_size: [25, 35]
+    bundle_size: [2,4]
   MIoT:
     chain: [NAT, FW, IDPS]
     bandwidth: 5
     delay: 30
-    bundle_size: [30, 40]
+    # bundle_size: [30, 40]
+    bundle_size: [2,4]
   Ind4.0:
     chain: [NAT, FW, IDPS, TM]
     bandwidth: 20
     delay: 10
-    bundle_size: [10, 20]
+    # bundle_size: [10, 20]
+    bundle_size: [2,4]
 
 # VNF Resources
 vnf_resources:
@@ -97,19 +103,20 @@ network:
 
 # Training Configuration
 training:
-  num_updates: 100
-  episodes_per_update: 10
-  actions_per_step: 50
+  num_updates: 20              # Giảm từ 100 xuống 20
+  episodes_per_update: 3       # Giảm từ 20 xuống 3
+  actions_per_step: 20         # Giảm từ 100 xuống 20
   step_duration: 1
   action_inference_time: 0.01
   request_generation_interval: 4
   gamma: 0.99
   learning_rate: 0.001
-  batch_size: 64
-  replay_buffer_size: 50000
+  batch_size: 32               # Giảm từ 64 xuống 32
+  replay_buffer_size: 5000     # Giảm từ 50000 xuống 5000
   epsilon_start: 1.0
   epsilon_end: 0.01
   epsilon_decay: 0.995
+  max_steps_per_episode: 200   # THÊM: Giới hạn steps
 
 # Rewards
 rewards:

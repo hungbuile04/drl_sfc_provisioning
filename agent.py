@@ -1,202 +1,146 @@
 """
-DRL Agent for SFC Provisioning
+DQN Agent with Experience Replay and Target Network
 """
-import torch
-import torch.optim as optim
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+import tensorflow as tf
 import numpy as np
-from omegaconf import DictConfig
-from dqn_model import DQNModel, ReplayBuffer
+from collections import deque
+
+import config
+from dqn_model import build_q_network
 
 
-class DRLAgent:
-    def __init__(self, cfg: DictConfig, device='cpu'):
-        self.cfg = cfg
-        self.device = device
-        
-        # Create networks
-        self.policy_net = DQNModel(cfg).to(device)
-        self.target_net = DQNModel(cfg).to(device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
-        
-        # Optimizer
-        self.optimizer = optim.Adam(self.policy_net.parameters(), 
-                                    lr=cfg.training.learning_rate)
-        
-        # Replay buffer
-        self.memory = ReplayBuffer(cfg.training.replay_buffer_size)
-        
-        # Training parameters
-        self.gamma = cfg.training.gamma
-        self.batch_size = cfg.training.batch_size
-        self.epsilon = cfg.training.epsilon_start
-        self.epsilon_end = cfg.training.epsilon_end
-        self.epsilon_decay = cfg.training.epsilon_decay
-        
-        self.action_dim = 2 * len(cfg.vnf_types) + 1
+class Agent:
+    """DQN Agent for SFC Provisioning"""
     
-    def select_action(self, state1, state2, state3, training=True):
-        """Select action using epsilon-greedy policy"""
-        if training and np.random.random() < self.epsilon:
-            return np.random.randint(0, self.action_dim)
-        else:
-            with torch.no_grad():
-                state1 = torch.FloatTensor(state1).unsqueeze(0).to(self.device)
-                state2 = torch.FloatTensor(state2).unsqueeze(0).to(self.device)
-                state3 = torch.FloatTensor(state3).unsqueeze(0).to(self.device)
-                
-                q_values = self.policy_net(state1, state2, state3)
-                return q_values.argmax().item()
+    def __init__(self):
+        self.model = build_q_network()
+        self.target_model = build_q_network()
+        self.update_target_model()
+        
+        self.batch_size = config.BATCH_SIZE
+        self.optimizer = self.model.optimizer
+        self.loss_fn = tf.keras.losses.MeanSquaredError()
+        
+        self.global_replay_memory = deque(maxlen=config.MEMORY_SIZE)
     
-    def store_transition(self, state1, state2, state3, action, reward, 
-                        next_state1, next_state2, next_state3, done):
-        """Store transition in replay buffer"""
-        self.memory.push(state1, state2, state3, action, reward,
-                        next_state1, next_state2, next_state3, done)
+    def reset_global_replay_memory(self):
+        """Reset replay memory"""
+        self.global_replay_memory = deque(maxlen=config.MEMORY_SIZE)
     
-    def train_step(self):
-        """Perform one training step"""
-        if len(self.memory) < self.batch_size:
-            return None
+    def update_target_model(self):
+        """Copy weights from model to target_model"""
+        self.target_model.set_weights(self.model.get_weights())
+    
+    def get_action(self, state, epsilon, valid_actions_mask=None):
+        """
+        Select action using epsilon-greedy policy
+        
+        Args:
+            state: Tuple (s1, s2, s3)
+            epsilon: Exploration rate
+            valid_actions_mask: Boolean array indicating valid actions
+            
+        Returns:
+            int: Action ID
+        """
+        # Exploration
+        if np.random.rand() <= epsilon:
+            if valid_actions_mask is not None:
+                valid_indices = np.where(valid_actions_mask)[0]
+                return np.random.choice(valid_indices) if len(valid_indices) > 0 else 0
+            return np.random.randint(config.ACTION_SPACE_SIZE)
+        
+        # Exploitation
+        s1 = state[0].reshape(1, -1)
+        s2 = state[1].reshape(1, -1)
+        s3 = state[2].reshape(1, -1)
+        
+        q_values = self.model([s1, s2, s3], training=False)[0].numpy()
+        
+        if valid_actions_mask is not None:
+            q_values = np.where(valid_actions_mask, q_values, -np.inf)
+        
+        return np.argmax(q_values)
+    
+    @tf.function
+    def train_step(self, state_batch, action_batch, reward_batch, next_state_batch, done_batch):
+        """
+        Optimized training step with TF graph
+        
+        Args:
+            state_batch: [3 tensors]
+            next_state_batch: [3 tensors]
+            action_batch: int32 tensor
+            reward_batch: float32 tensor
+            done_batch: bool tensor
+        """
+        # Compute target Q-values
+        next_q = self.target_model(next_state_batch, training=False)
+        max_next_q = tf.reduce_max(next_q, axis=1)
+        targets = reward_batch + (1.0 - tf.cast(done_batch, tf.float32)) * config.GAMMA * max_next_q
+        
+        # Train main network
+        with tf.GradientTape() as tape:
+            q_values = self.model(state_batch, training=True)
+            
+            # Gather Q(s,a)
+            batch_indices = tf.range(self.batch_size, dtype=tf.int32)
+            action_indices = tf.stack([batch_indices, action_batch], axis=1)
+            predicted = tf.gather_nd(q_values, action_indices)
+            
+            loss = self.loss_fn(targets, predicted)
+        
+        grads = tape.gradient(loss, self.model.trainable_variables)
+        self.optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
+        
+        return loss
+    
+    def train(self):
+        """Sample from memory and train"""
+        if len(self.global_replay_memory) < self.batch_size:
+            return 0.0
         
         # Sample batch
-        state1, state2, state3, action, reward, next_state1, next_state2, next_state3, done = \
-            self.memory.sample(self.batch_size)
+        idx = np.random.choice(len(self.global_replay_memory), self.batch_size, replace=False)
         
-        state1 = state1.to(self.device)
-        state2 = state2.to(self.device)
-        state3 = state3.to(self.device)
-        action = action.to(self.device)
-        reward = reward.to(self.device)
-        next_state1 = next_state1.to(self.device)
-        next_state2 = next_state2.to(self.device)
-        next_state3 = next_state3.to(self.device)
-        done = done.to(self.device)
+        # Prepare data
+        state1, state2, state3 = [], [], []
+        next1, next2, next3 = [], [], []
+        actions, rewards, dones = [], [], []
         
-        # Current Q values
-        current_q_values = self.policy_net(state1, state2, state3)
-        current_q_values = current_q_values.gather(1, action.unsqueeze(1)).squeeze(1)
+        for i in idx:
+            s, a, r, ns, d = self.global_replay_memory[i]
+            state1.append(s[0])
+            state2.append(s[1])
+            state3.append(s[2])
+            next1.append(ns[0])
+            next2.append(ns[1])
+            next3.append(ns[2])
+            actions.append(a)
+            rewards.append(r)
+            dones.append(d)
         
-        # Next Q values
-        with torch.no_grad():
-            next_q_values = self.target_net(next_state1, next_state2, next_state3)
-            max_next_q_values = next_q_values.max(1)[0]
-            target_q_values = reward + (1 - done) * self.gamma * max_next_q_values
+        # Convert to tensors
+        state_batch = [
+            tf.convert_to_tensor(np.array(state1), dtype=tf.float32),
+            tf.convert_to_tensor(np.array(state2), dtype=tf.float32),
+            tf.convert_to_tensor(np.array(state3), dtype=tf.float32),
+        ]
+        next_state_batch = [
+            tf.convert_to_tensor(np.array(next1), dtype=tf.float32),
+            tf.convert_to_tensor(np.array(next2), dtype=tf.float32),
+            tf.convert_to_tensor(np.array(next3), dtype=tf.float32),
+        ]
         
-        # Compute loss
-        loss = torch.nn.functional.mse_loss(current_q_values, target_q_values)
+        loss = self.train_step(
+            state_batch=state_batch,
+            action_batch=tf.convert_to_tensor(actions, dtype=tf.int32),
+            reward_batch=tf.convert_to_tensor(rewards, dtype=tf.float32),
+            next_state_batch=next_state_batch,
+            done_batch=tf.convert_to_tensor(dones, dtype=tf.bool),
+        )
         
-        # Optimize
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-        self.optimizer.step()
-        
-        return loss.item()
-    
-    def update_target_network(self):
-        """Update target network"""
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-    
-    def decay_epsilon(self):
-        """Decay exploration rate"""
-        self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
-    
-    def save_model(self, path):
-        """Save model"""
-        torch.save({
-            'policy_net_state_dict': self.policy_net.state_dict(),
-            'target_net_state_dict': self.target_net.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'epsilon': self.epsilon
-        }, path)
-    
-    def load_model(self, path):
-        """Load model"""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.policy_net.load_state_dict(checkpoint['policy_net_state_dict'])
-        self.target_net.load_state_dict(checkpoint['target_net_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.epsilon = checkpoint['epsilon']
-
-
-class StateBuilder:
-    """Helper class to build state representations"""
-    
-    def __init__(self, cfg: DictConfig):
-        self.cfg = cfg
-    
-    def build_state1(self, dc):
-        """Build state 1: Current DC information"""
-        state = []
-        
-        # Installed VNFs count
-        for vnf_type in self.cfg.vnf_types:
-            state.append(dc.installed_vnfs[vnf_type])
-        
-        # Available VNFs for allocation
-        for vnf_type in self.cfg.vnf_types:
-            available = dc.installed_vnfs[vnf_type] - dc.allocated_vnfs[vnf_type]
-            state.append(available)
-        
-        # Available storage (normalized)
-        state.append(dc.storage_available / dc.storage_total)
-        
-        # Available CPU (normalized)
-        state.append(dc.cpu_available / dc.cpu_total)
-        
-        return np.array(state, dtype=np.float32)
-    
-    def build_state2(self, env, dc_id):
-        """Build state 2: SFC processing stages by current DC"""
-        state = []
-        
-        for sfc_type in self.cfg.sfc_types:
-            sfc_id = self.cfg.sfc_types.index(sfc_type)
-            
-            allocated = [0] * len(self.cfg.vnf_types)
-            remaining = [0] * len(self.cfg.vnf_types)
-            
-            for sfc in env.sfc_requests:
-                if sfc.sfc_type == sfc_type and dc_id in sfc.allocated_dcs:
-                    for vnf in sfc.allocated_vnfs:
-                        if sfc.allocated_dcs[sfc.allocated_vnfs.index(vnf)] == dc_id:
-                            vnf_idx = self.cfg.vnf_types.index(vnf)
-                            allocated[vnf_idx] += 1
-                    
-                    next_vnf = sfc.get_next_vnf()
-                    if next_vnf:
-                        vnf_idx = self.cfg.vnf_types.index(next_vnf)
-                        remaining[vnf_idx] += 1
-            
-            state.extend([sfc_id] + allocated + remaining)
-        
-        return np.array(state, dtype=np.float32)
-    
-    def build_state3(self, env):
-        """Build state 3: Overall pending SFC requests"""
-        state = []
-        
-        for sfc_type in self.cfg.sfc_types:
-            sfc_id = self.cfg.sfc_types.index(sfc_type)
-            
-            type_requests = [sfc for sfc in env.sfc_requests if sfc.sfc_type == sfc_type]
-            request_count = len(type_requests)
-            
-            if type_requests:
-                min_time = min([sfc.get_remaining_time(env.current_time) for sfc in type_requests])
-            else:
-                min_time = 0
-            
-            bandwidth = self.cfg.sfc_characteristics[sfc_type]['bandwidth']
-            
-            vnf_counts = [0] * len(self.cfg.vnf_types)
-            for sfc in type_requests:
-                next_vnf = sfc.get_next_vnf()
-                if next_vnf:
-                    vnf_idx = self.cfg.vnf_types.index(next_vnf)
-                    vnf_counts[vnf_idx] += 1
-            
-            state.extend([sfc_id, request_count, min_time / 100.0, bandwidth / 100.0] + vnf_counts)
-        
-        return np.array(state, dtype=np.float32)
+        return float(loss.numpy())
