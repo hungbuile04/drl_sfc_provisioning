@@ -8,6 +8,7 @@ Implementation của bài báo "Unlocking Reconfigurability for Deep Reinforceme
 sfc-drl/
 ├── conf/
 │   └── config.yaml          # Hydra configuration
+├── config.py                # Main config
 ├── environment.py           # Network environment
 ├── dqn_model.py             # DQN với attention layer
 ├── agent.py                 # DRL agent
